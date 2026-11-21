@@ -1,0 +1,105 @@
+name: V91 recovery control
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Full reviewed main commit SHA
+        required: true
+        type: string
+      confirm:
+        description: Type CHECK_DISABLED_CONTROLLER
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  safety:
+    name: Credential-free controller safety
+    if: >-
+      github.repository == 'zillaelectrical-design/alpine-v91-restore-runner' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'pull_request' && github.base_ref == 'main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the trusted revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify controller files and synthetic controls
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sha256sum --check SHA256SUMS
+          python3 tests/test_controller.py
+      - name: Check proposed changes as data
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]
+          git fetch --no-tags --depth=1 origin "$GITHUB_REF"
+          [[ "$(git rev-parse FETCH_HEAD)" == "$GITHUB_SHA" ]]
+          git diff --exit-code HEAD FETCH_HEAD -- .github tests certs SHA256SUMS
+
+  authorize:
+    if: >-
+      github.repository == 'zillaelectrical-design/alpine-v91-restore-runner' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify exact dispatch identity and inputs
+        env:
+          APPROVED_SHA: ${{ vars.REVIEWED_SHA }}
+        shell: bash
+        run: |
+          # dispatch guard
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == zillaelectrical-design/alpine-v91-restore-runner ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_SHA" == "$APPROVED_SHA" && "$GITHUB_WORKFLOW_SHA" == "$APPROVED_SHA" ]]
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import sys
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              inputs = json.load(event_file).get("inputs")
+          expected = {
+              "confirm": "CHECK_DISABLED_CONTROLLER",
+              "reviewed_sha": os.environ["APPROVED_SHA"],
+          }
+          if inputs != expected:
+              sys.exit("Dispatch inputs rejected")
+          PYTHON
+          # end dispatch guard
+
+  disabled:
+    needs: authorize
+    if: >-
+      github.repository == 'zillaelectrical-design/alpine-v91-restore-runner' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      needs.authorize.result == 'success'
+    environment: alpine-v91-restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Stop before recovery
+        shell: bash
+        run: |
+          # recovery barrier
+          echo 'BLOCKED: recovery is disabled'
+          exit 66
+          # end recovery barrier
